@@ -1,0 +1,191 @@
+name: Standalone Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: standalone-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: sqlite,vendored_openssl
+            bin: vaultwarden.exe
+            musl: "false"
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: sqlite,vendored_openssl,enable_mimalloc
+            bin: vaultwarden
+            musl: "true"
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            features: sqlite,vendored_openssl,enable_mimalloc
+            bin: vaultwarden
+            musl: "true"
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            features: sqlite,vendored_openssl
+            bin: vaultwarden
+            musl: "false"
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            features: sqlite,vendored_openssl
+            bin: vaultwarden
+            musl: "false"
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: NASM (vendored OpenSSL)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Strawberry Perl (Windows)
+        if: runner.os == 'Windows'
+        run: choco install strawberryperl -y --no-progress
+
+      - name: Zig (musl)
+        if: matrix.musl == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: cargo-zigbuild
+        if: matrix.musl == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build (musl)
+        if: matrix.musl == 'true'
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
+
+      - name: Build (native)
+        if: matrix.musl != 'true'
+        run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
+
+      - name: Download web-vault
+        run: |
+          set -euo pipefail
+          VER=$(python -c "import re,pathlib; t=pathlib.Path('docker/DockerSettings.yaml').read_text(encoding='utf-8'); print(re.search(r'vault_version:\s*\"([^\"]+)\"', t).group(1))")
+          echo "WEB_VAULT=$VER"
+          curl -fsSL -o bw_web.tgz "https://github.com/dani-garcia/bw_web_builds/releases/download/${VER}/bw_web_${VER}.tar.gz"
+          tar -xzf bw_web.tgz
+          test -f web-vault/index.html
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          STAGE="pkg/${{ matrix.name }}"
+          mkdir -p "$STAGE/data"
+          cp -a web-vault "$STAGE/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
+          cp deploy/standalone/.env.example "$STAGE/.env"
+          cp deploy/standalone/README.txt "$STAGE/"
+          if [[ "${{ matrix.bin }}" == *.exe ]]; then
+            cp deploy/standalone/start.ps1 deploy/standalone/start.bat "$STAGE/"
+          else
+            cp deploy/standalone/start.sh "$STAGE/"
+            chmod +x "$STAGE/start.sh" "$STAGE/${{ matrix.bin }}"
+          fi
+          python -c "import shutil; shutil.make_archive('vaultwarden-${{ matrix.name }}', 'zip', 'pkg/${{ matrix.name }}')"
+          ls -lh vaultwarden-${{ matrix.name }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-${{ matrix.name }}
+          path: vaultwarden-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -lh artifacts
+          cat > notes.md <<'EOF'
+          ## Standalone packages (no Docker)
+
+          Unzip and run `start.ps1` / `start.bat` (Windows) or `./start.sh` (Linux/macOS).
+          Open http://127.0.0.1:8000
+
+          Web Vault is bundled. Point official Bitwarden clients at this server.
+
+          ### Bitwarden clients
+
+          - All platforms: https://bitwarden.com/download/
+          - iOS: https://apps.apple.com/app/bitwarden-password-manager/id1137397744
+          - Android: https://play.google.com/store/apps/details?id=com.x8bit.bitwarden
+          - Android APK: https://github.com/bitwarden/android/releases
+          - Desktop: https://github.com/bitwarden/clients/releases
+          - Chrome: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
+          - Firefox: https://addons.mozilla.org/firefox/addon/bitwarden-password-manager/
+          - Edge: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh
+          - Safari: https://apps.apple.com/app/bitwarden/id1352778147
+          EOF
+
+          shopt -s nullglob
+          FILES=(artifacts/*.zip)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "no zip artifacts" >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            gh release create "$TAG" --title "Vaultwarden $TAG (standalone)" --notes-file notes.md "${FILES[@]}"
+          else
+            if gh release view standalone-nightly >/dev/null 2>&1; then
+              gh release delete standalone-nightly --yes
+            fi
+            git tag -f standalone-nightly
+            git push -f origin standalone-nightly
+            gh release create standalone-nightly --prerelease --title "Standalone nightly" --notes-file notes.md "${FILES[@]}"
+          fi
