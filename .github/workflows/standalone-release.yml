@@ -20,7 +20,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -67,15 +67,24 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.97.1
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: NASM (vendored OpenSSL)
         uses: ilammy/setup-nasm@v1
 
-      - name: Strawberry Perl (Windows)
+      - name: Setup Perl and dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install strawberryperl -y --no-progress
+        shell: powershell
+        run: |
+          # Install Strawberry Perl
+          choco install strawberryperl -y --no-progress
+          # Force refresh PATH
+          $env:PATH = "C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
+          # Verify Perl installation
+          perl --version
+          # Install required Perl modules
+          cpan -i Locale::Maketext::Simple
 
       - name: Zig (musl)
         if: matrix.musl == 'true'
@@ -89,11 +98,29 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: Build (musl)
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build with zigbuild (musl)
         if: matrix.musl == 'true'
         run: cargo zigbuild --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
 
-      - name: Build (native)
+      - name: Build native
         if: matrix.musl != 'true'
         run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
 
@@ -101,10 +128,11 @@ jobs:
         run: |
           set -euo pipefail
           VER=$(python -c "import re,pathlib; t=pathlib.Path('docker/DockerSettings.yaml').read_text(encoding='utf-8'); print(re.search(r'vault_version:\s*\"([^\"]+)\"', t).group(1))")
-          echo "WEB_VAULT=$VER"
+          echo "Web Vault version: $VER"
           curl -fsSL -o bw_web.tgz "https://github.com/dani-garcia/bw_web_builds/releases/download/${VER}/bw_web_${VER}.tar.gz"
           tar -xzf bw_web.tgz
           test -f web-vault/index.html
+          echo "Web vault extracted successfully"
 
       - name: Package
         run: |
@@ -124,16 +152,26 @@ jobs:
           python -c "import shutil; shutil.make_archive('vaultwarden-${{ matrix.name }}', 'zip', 'pkg/${{ matrix.name }}')"
           ls -lh vaultwarden-${{ matrix.name }}.zip
 
+      - name: Generate checksums
+        run: |
+          sha256sum vaultwarden-${{ matrix.name }}.zip > vaultwarden-${{ matrix.name }}.zip.sha256
+          cat vaultwarden-${{ matrix.name }}.zip.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: vaultwarden-${{ matrix.name }}
-          path: vaultwarden-${{ matrix.name }}.zip
+          path: |
+            vaultwarden-${{ matrix.name }}.zip
+            vaultwarden-${{ matrix.name }}.zip.sha256
           if-no-files-found: error
+          retention-days: 5
 
   publish:
+    name: Publish Release
     needs: build
     runs-on: ubuntu-latest
+    if: success()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -144,48 +182,126 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: List artifacts
+        run: |
+          echo "Available artifacts:"
+          ls -lh artifacts/
+
+      - name: Create release notes
+        run: |
+          cat > notes.md <<'EOF'
+          # Vaultwarden Standalone Release
+
+          This release provides native binary packages for multiple platforms with bundled Web Vault.
+
+          ## Quick Start
+
+          1. **Extract the archive** for your platform
+          2. **Configure** via `.env` file or environment variables
+          3. **Run** using the provided start script:
+             - **Windows**: `start.ps1` or `start.bat`
+             - **Linux/macOS**: `./start.sh`
+          4. **Access** at `http://127.0.0.1:8000`
+
+          ## Platform Information
+
+          - **windows-x64**: Windows 10+ (Intel/AMD)
+          - **linux-x64**: Linux x86_64 (statically linked, glibc independent)
+          - **linux-arm64**: Linux ARM64 (e.g., Raspberry Pi 4)
+          - **macos-arm64**: macOS 11+ (Apple Silicon)
+          - **macos-x64**: macOS 10.12+ (Intel)
+
+          ## Features
+
+          - ✅ Bundled Web Vault
+          - ✅ SQLite database (ready to use, no setup required)
+          - ✅ Vendored OpenSSL (no system dependencies)
+          - ✅ Optimized binary size with MiMalloc
+          - ✅ Full Bitwarden API compatibility
+
+          ## Bitwarden Clients
+
+          Use official Bitwarden clients with this server:
+          - **Web**: https://vault.bitwarden.com (configure custom server domain)
+          - **Desktop**: https://bitwarden.com/download/
+          - **Mobile**:
+            - iOS: https://apps.apple.com/app/bitwarden/id1352778147
+            - Android: https://play.google.com/store/apps/details?id=com.x8bit.bitwarden
+          - **Browser Extensions**:
+            - Chrome: https://chrome.google.com/webstore/detail/nngceckbapebfimnlniiiahkandclblb
+            - Firefox: https://addons.mozilla.org/firefox/addon/bitwarden-password-manager/
+            - Edge: https://microsoftedge.microsoft.com/addons/detail/jbkfoedolllekgbhcbcoahefnbanhhlh
+            - Safari: https://apps.apple.com/app/bitwarden/id1352778147
+
+          ## Verification
+
+          Verify integrity using SHA256 checksums:
+          ```bash
+          sha256sum -c *.sha256
+          ```
+
+          ## Support
+
+          For issues and questions:
+          - GitHub Issues: https://github.com/dani-garcia/vaultwarden/issues
+          - Wiki: https://github.com/dani-garcia/vaultwarden/wiki
+          - Forum: https://vaultwarden.discourse.group
+
+          ---
+          **Note**: This is Vaultwarden, an unofficial Bitwarden server implementation.
+          EOF
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ls -lh artifacts
-          cat > notes.md <<'EOF'
-          ## Standalone packages (no Docker)
-
-          Unzip and run `start.ps1` / `start.bat` (Windows) or `./start.sh` (Linux/macOS).
-          Open http://127.0.0.1:8000
-
-          Web Vault is bundled. Point official Bitwarden clients at this server.
-
-          ### Bitwarden clients
-
-          - All platforms: https://bitwarden.com/download/
-          - iOS: https://apps.apple.com/app/bitwarden-password-manager/id1137397744
-          - Android: https://play.google.com/store/apps/details?id=com.x8bit.bitwarden
-          - Android APK: https://github.com/bitwarden/android/releases
-          - Desktop: https://github.com/bitwarden/clients/releases
-          - Chrome: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
-          - Firefox: https://addons.mozilla.org/firefox/addon/bitwarden-password-manager/
-          - Edge: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh
-          - Safari: https://apps.apple.com/app/bitwarden/id1352778147
-          EOF
-
+          
+          # Collect all artifacts
           shopt -s nullglob
-          FILES=(artifacts/*.zip)
+          FILES=(artifacts/*.zip artifacts/*.sha256)
+          
           if [ ${#FILES[@]} -eq 0 ]; then
-            echo "no zip artifacts" >&2
+            echo "Error: No artifacts found" >&2
             exit 1
           fi
-
+          
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF_NAME}"
-            gh release create "$TAG" --title "Vaultwarden $TAG (standalone)" --notes-file notes.md "${FILES[@]}"
+            echo "Creating release for tag: $TAG"
+            gh release create "$TAG" \
+              --title "Vaultwarden $TAG" \
+              --notes-file notes.md \
+              "${FILES[@]}"
           else
-            if gh release view standalone-nightly >/dev/null 2>&1; then
-              gh release delete standalone-nightly --yes
+            echo "Creating/updating nightly release"
+            
+            # Delete old nightly if it exists
+            if gh release view nightly >/dev/null 2>&1; then
+              gh release delete nightly --yes
             fi
-            git tag -f standalone-nightly
-            git push -f origin standalone-nightly
-            gh release create standalone-nightly --prerelease --title "Standalone nightly" --notes-file notes.md "${FILES[@]}"
+            
+            # Create new nightly
+            git tag -f nightly
+            git push -f origin nightly
+            gh release create nightly \
+              --prerelease \
+              --title "Nightly Build" \
+              --notes-file notes.md \
+              "${FILES[@]}"
           fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms built:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Windows x64" >> $GITHUB_STEP_SUMMARY
+          echo "- Linux x64" >> $GITHUB_STEP_SUMMARY
+          echo "- Linux ARM64" >> $GITHUB_STEP_SUMMARY
+          echo "- macOS ARM64" >> $GITHUB_STEP_SUMMARY
+          echo "- macOS x64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifacts:**" >> $GITHUB_STEP_SUMMARY
+          ls -1 artifacts/ | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
